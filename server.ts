@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
+import crypto from 'crypto';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
@@ -237,6 +239,150 @@ async function startServer() {
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
+  });
+
+  app.get('/api/download-apk', (_req, res) => {
+    const candidates = [
+      path.join(__dirname, 'public', 'downloads', 'Aurora-AI-Studio.apk'),
+      path.join(__dirname, 'dist', 'downloads', 'Aurora-AI-Studio.apk'),
+    ];
+    const apkPath = candidates.find((p) => fs.existsSync(p));
+    if (!apkPath) {
+      res.status(404).json({ error: 'APK file not found.' });
+      return;
+    }
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.download(apkPath, 'Aurora-AI-Studio.apk');
+  });
+
+  const otpHmacSecret =
+    process.env.AUTH_OTP_SECRET ||
+    ((globalThis as { __auroraOtpSecret?: string }).__auroraOtpSecret ??=
+      crypto.randomBytes(32).toString('hex'));
+
+  function signOtpChallenge(payload: {
+    uid: string;
+    email: string;
+    codeHash: string;
+    exp: number;
+  }): string {
+    const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+    const sig = crypto.createHmac('sha256', otpHmacSecret).update(body).digest('base64url');
+    return `${body}.${sig}`;
+  }
+
+  function verifyOtpChallengeToken(
+    token: string
+  ): { uid: string; email: string; codeHash: string; exp: number } | null {
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    const [body, sig] = parts;
+    const expectedSig = crypto
+      .createHmac('sha256', otpHmacSecret)
+      .update(body)
+      .digest('base64url');
+    const sigBuf = Buffer.from(sig, 'utf8');
+    const expectedBuf = Buffer.from(expectedSig, 'utf8');
+    if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as {
+        uid?: unknown;
+        email?: unknown;
+        codeHash?: unknown;
+        exp?: unknown;
+      };
+      if (
+        typeof parsed.uid !== 'string' ||
+        typeof parsed.email !== 'string' ||
+        typeof parsed.codeHash !== 'string' ||
+        typeof parsed.exp !== 'number'
+      ) {
+        return null;
+      }
+      return {
+        uid: parsed.uid,
+        email: parsed.email,
+        codeHash: parsed.codeHash,
+        exp: parsed.exp,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  app.post('/api/auth/verification-code', (req, res) => {
+    const body = (req.body || {}) as { uid?: unknown; email?: unknown };
+    const uid = typeof body.uid === 'string' ? body.uid.trim() : '';
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+
+    if (!uid || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ error: 'Valid user ID and email address are required.' });
+      return;
+    }
+
+    const code = String(crypto.randomInt(100000, 1000000));
+    const codeHash = crypto
+      .createHash('sha256')
+      .update(`${uid}:${email}:${code}`)
+      .digest('hex');
+    const expiresAt = Date.now() + 10 * 60 * 1000;
+    const challengeToken = signOtpChallenge({ uid, email, codeHash, exp: expiresAt });
+
+    res.json({
+      challengeToken,
+      previewCode: code,
+      expiresAt,
+    });
+  });
+
+  app.post('/api/auth/verify-code', (req, res) => {
+    const body = (req.body || {}) as {
+      uid?: unknown;
+      email?: unknown;
+      code?: unknown;
+      challengeToken?: unknown;
+    };
+    const uid = typeof body.uid === 'string' ? body.uid.trim() : '';
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const code = typeof body.code === 'string' ? body.code.replace(/\D/g, '') : '';
+    const challengeToken =
+      typeof body.challengeToken === 'string' ? body.challengeToken.trim() : '';
+
+    if (!uid || !email || code.length !== 6 || !challengeToken) {
+      res.status(400).json({ error: 'Please enter a valid 6-digit verification code.' });
+      return;
+    }
+
+    const payload = verifyOtpChallengeToken(challengeToken);
+    if (!payload) {
+      res.status(400).json({ error: 'Invalid verification session. Request a new code.' });
+      return;
+    }
+
+    if (Date.now() > payload.exp) {
+      res.status(400).json({ error: 'Verification code expired. Please request a new code.' });
+      return;
+    }
+
+    if (payload.uid !== uid || payload.email !== email) {
+      res.status(400).json({ error: 'Verification code does not match this account.' });
+      return;
+    }
+
+    const candidateHash = crypto
+      .createHash('sha256')
+      .update(`${uid}:${email}:${code}`)
+      .digest('hex');
+    const a = Buffer.from(candidateHash, 'utf8');
+    const b = Buffer.from(payload.codeHash, 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      res.status(400).json({ error: 'Incorrect verification code. Please check and try again.' });
+      return;
+    }
+
+    res.json({ verified: true });
   });
 
   const rawVideoParser = express.raw({
@@ -665,12 +811,18 @@ async function startServer() {
   const modelCooldownUntil = new Map<string, number>();
 
   const VOICE_STYLE_MAP: Record<string, string> = {
-    Charon: 'Natural, warm, clear young adult male speaker with an authentic human voice',
-    Puck: 'Natural, energetic, friendly young male speaker with an authentic human voice',
-    Fenrir: 'Deep, calm, confident male speaker with a natural human voice',
-    Orus: 'Crisp, steady, natural male conversational speaker',
-    Kore: 'Warm, clear, natural female speaker with an authentic human voice',
-    Zephyr: 'Bright, friendly, conversational female speaker with a natural human voice',
+    Fenrir:
+      'Deep, grounded, unmistakable adult male speaker with rich masculine baritone and natural human warmth',
+    Orus:
+      'Firm, crisp, steady adult male speaker with natural masculine baritone and clear conversational cadence',
+    Charon:
+      'Warm, natural male speaker with clear masculine chest voice and relaxed conversational delivery',
+    Puck:
+      'Natural young male speaker with clear masculine tone and energetic friendly delivery',
+    Kore:
+      'Warm, clear, natural female speaker with an authentic human voice',
+    Zephyr:
+      'Bright, friendly, conversational female speaker with a natural human voice',
   };
 
   app.post('/api/audio/tts', async (req, res) => {
@@ -704,7 +856,7 @@ async function startServer() {
       }
 
       const ai = getGeminiClient();
-      const ttsModels = ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
+      const ttsModels = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'];
       const now = Date.now();
       let lastRateLimit = false;
       const langLabel = LANGUAGE_DIRECTIVES[selectedLang]?.label || 'the spoken text language';

@@ -271,8 +271,29 @@ export function useVoiceAssistant({
     [onError, onTranscriptReady, preferredLanguage, startGeminiRecorder, stopSpeaking]
   );
 
+  const loadBrowserVoices = useCallback((): Promise<SpeechSynthesisVoice[]> => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      return Promise.resolve([]);
+    }
+    const existing = window.speechSynthesis.getVoices();
+    if (existing.length > 0) return Promise.resolve(existing);
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        window.speechSynthesis.removeEventListener?.('voiceschanged', onVoices);
+        resolve(window.speechSynthesis.getVoices());
+      };
+      const onVoices = () => done();
+      window.speechSynthesis.addEventListener?.('voiceschanged', onVoices);
+      setTimeout(done, 350);
+    });
+  }, []);
+
   const speakWithBrowserFallback = useCallback(
-    (messageId: string, text: string, targetVoice: VoiceName) => {
+    async (messageId: string, text: string, targetVoice: VoiceName) => {
       if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
         onError?.('Voice playback could not start.');
         return;
@@ -289,42 +310,85 @@ export function useVoiceAssistant({
       const gender = getVoiceGender(targetVoice);
       const langOption = getLanguageOption(preferredLanguage);
       const langPrefix = langOption.speechLang.split('-')[0].toLowerCase();
-      const utterance = new SpeechSynthesisUtterance(clean.slice(0, 2000));
-      utterance.lang = langOption.speechLang;
-      const voices = window.speechSynthesis.getVoices();
+      const voices = await loadBrowserVoices();
 
       const femaleHints =
-        /\b(female|woman|girl|samantha|victoria|karen|zira|hazel|susan|veena|heera|lekha|kalpana|aria|jenny|natasha|sara|neerja|swara|aditi|raveena)\b|google us english|google uk english female/i;
+        /\b(female|woman|girl|samantha|victoria|karen|zira|hazel|susan|veena|heera|lekha|kalpana|aria|jenny|natasha|sara|neerja|swara|aditi|raveena|sonia|libby|clara|ava|allison|kate|serena|tessa|moira|fiona|monica|paulina|amelie|alice|anna|ellen|laura|melina|milena|nora|yuna|kyoko|tingting|meijia|sinji|carmit|damayanti|ioana|kanya|luciana|mariska|miren|monika|nicole|satu|tarja|zosia)\b|google us english|google uk english female|google हिन्दी|google hindi|google english \(india\)|hi-in-x-hia|hi-in-x-hic|en-in-x-ena|en-in-x-enc|en-us-x-sfg|en-us-x-tpc|en-gb-x-gba|en-gb-x-gbc/i;
+
       const maleHints =
-        /\b(male|man|boy|daniel|alex|david|mark|george|oliver|arthur|rishi|hemant|ravi|prabhat|madhur|guy|ryan|andrew|brian|christopher|eric)\b|google uk english male/i;
+        /\b(male|man|boy|daniel|alex|david|mark|george|oliver|arthur|rishi|hemant|ravi|prabhat|madhur|guy|ryan|andrew|brian|christopher|eric|steffan|roger|liam|william|thomas|connor|aaron|albert|fred|junior|ralph|reed|rocko|eddy|grandpa|jorge|juan|diego|carlos|luca|maged|tarik|xander|yuri|otoya|nicolas|martin|henrik|oskar)\b|google uk english male|hi-in-x-hid|hi-in-x-hie|en-in-x-end|en-in-x-ene|en-us-x-iom|en-us-x-tpd|en-us-x-iol|en-gb-x-gbd|en-gb-x-rjs/i;
+
+      const isMaleVoice = (v: SpeechSynthesisVoice) =>
+        maleHints.test(v.name) && !femaleHints.test(v.name);
+      const isFemaleVoice = (v: SpeechSynthesisVoice) =>
+        femaleHints.test(v.name) && !maleHints.test(v.name);
+
+      const hasNonLatinScript =
+        /[\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0A80-\u0AFF\u0B80-\u0BFF\u0C00-\u0C7F\u0600-\u06FF]/.test(
+          clean
+        );
 
       const langVoices = voices.filter((v) =>
         v.lang.toLowerCase().startsWith(langPrefix)
       );
-      const candidatePool = langVoices.length > 0 ? langVoices : voices;
+      const indianVoices = voices.filter((v) => {
+        const l = v.lang.toLowerCase();
+        return l.startsWith('hi') || l.startsWith('en-in');
+      });
+      const englishVoices = voices.filter((v) =>
+        v.lang.toLowerCase().startsWith('en')
+      );
 
       let matchedVoice: SpeechSynthesisVoice | undefined;
-      if (candidatePool.length > 0) {
+      if (voices.length > 0) {
         if (gender === 'boy') {
           matchedVoice =
-            candidatePool.find(
-              (v) => maleHints.test(v.name) && !femaleHints.test(v.name)
-            ) || candidatePool[0];
+            langVoices.find(isMaleVoice) ||
+            indianVoices.find(isMaleVoice) ||
+            (!hasNonLatinScript ? englishVoices.find(isMaleVoice) : undefined) ||
+            (!hasNonLatinScript ? voices.find(isMaleVoice) : undefined) ||
+            langVoices.find((v) => !isFemaleVoice(v)) ||
+            langVoices[0] ||
+            voices.find(isMaleVoice) ||
+            voices[0];
         } else {
           matchedVoice =
-            candidatePool.find(
-              (v) => femaleHints.test(v.name) && !maleHints.test(v.name)
-            ) || candidatePool[0];
-        }
-        if (matchedVoice) {
-          utterance.voice = matchedVoice;
+            langVoices.find(isFemaleVoice) ||
+            langVoices.find((v) => !isMaleVoice(v)) ||
+            langVoices[0] ||
+            voices.find(isFemaleVoice) ||
+            voices[0];
         }
       }
 
-      if (gender === 'boy') {
-        utterance.pitch = matchedVoice && maleHints.test(matchedVoice.name) ? 0.95 : 0.85;
+      const utterance = new SpeechSynthesisUtterance(clean.slice(0, 2000));
+      if (matchedVoice) {
+        utterance.voice = matchedVoice;
+        utterance.lang = matchedVoice.lang || langOption.speechLang;
       } else {
-        utterance.pitch = matchedVoice && femaleHints.test(matchedVoice.name) ? 1.04 : 1.12;
+        utterance.lang = langOption.speechLang;
+      }
+
+      if (gender === 'boy') {
+        const matchedRealMale = matchedVoice ? isMaleVoice(matchedVoice) : false;
+        const matchedFemaleFallback = matchedVoice ? isFemaleVoice(matchedVoice) : false;
+        if (matchedRealMale) {
+          utterance.pitch =
+            targetVoice === 'Fenrir'
+              ? 0.88
+              : targetVoice === 'Orus'
+                ? 0.92
+                : targetVoice === 'Charon'
+                  ? 0.95
+                  : 1.0;
+        } else if (matchedFemaleFallback) {
+          utterance.pitch = targetVoice === 'Fenrir' ? 0.65 : 0.72;
+        } else {
+          utterance.pitch = targetVoice === 'Fenrir' ? 0.76 : 0.82;
+        }
+      } else {
+        utterance.pitch =
+          matchedVoice && isFemaleVoice(matchedVoice) ? 1.04 : 1.12;
       }
 
       utterance.rate = 1.0;
@@ -337,7 +401,7 @@ export function useVoiceAssistant({
         window.speechSynthesis.speak(utterance);
       }, 30);
     },
-    [onError, preferredLanguage]
+    [loadBrowserVoices, onError, preferredLanguage]
   );
 
   const speakText = useCallback(
@@ -393,7 +457,7 @@ export function useVoiceAssistant({
         const data = await response.json();
         if (!response.ok || data.fallback || !data.audioBase64) {
           setLoadingSpeechId(null);
-          speakWithBrowserFallback(messageId, text, targetVoice);
+          await speakWithBrowserFallback(messageId, text, targetVoice);
           return;
         }
 
@@ -407,7 +471,7 @@ export function useVoiceAssistant({
         await playWavBase64(data.audioBase64, data.mimeType || 'audio/wav');
       } catch {
         setLoadingSpeechId(null);
-        speakWithBrowserFallback(messageId, text, targetVoice);
+        await speakWithBrowserFallback(messageId, text, targetVoice);
       }
     },
     [preferredLanguage, speakWithBrowserFallback, speakingId, stopSpeaking, voiceName]

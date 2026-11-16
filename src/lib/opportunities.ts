@@ -19,15 +19,15 @@ export const VOICE_OPTIONS: {
 }[] = [
   { id: 'Kore', label: 'Kore', gender: 'girl', tone: 'Warm & natural female voice' },
   { id: 'Zephyr', label: 'Zephyr', gender: 'girl', tone: 'Bright & conversational female voice' },
-  { id: 'Charon', label: 'Charon', gender: 'boy', tone: 'Warm, clear young man voice' },
+  { id: 'Fenrir', label: 'Fenrir', gender: 'boy', tone: 'Deep, real & confident male voice' },
   { id: 'Orus', label: 'Orus', gender: 'boy', tone: 'Crisp, steady natural male voice' },
+  { id: 'Charon', label: 'Charon', gender: 'boy', tone: 'Warm, clear young man voice' },
   { id: 'Puck', label: 'Puck', gender: 'boy', tone: 'Energetic & friendly young boy voice' },
-  { id: 'Fenrir', label: 'Fenrir', gender: 'boy', tone: 'Deep & confident male voice' },
 ];
 
 export const DEFAULT_VOICE_BY_GENDER: Record<VoiceGender, VoiceName> = {
   girl: 'Kore',
-  boy: 'Charon',
+  boy: 'Fenrir',
 };
 
 export function getVoiceGender(voice: VoiceName): VoiceGender {

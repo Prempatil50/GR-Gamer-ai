@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from 'react';
 import {
   Check,
   Compass,
+  Download,
   LogOut,
   MessageSquare,
   Palette,
@@ -385,6 +386,17 @@ export function Sidebar({
             <Palette className="w-4 h-4 shrink-0" style={{ color: 'var(--accent-primary)' }} />
             <span>Language, Voice & Theme</span>
           </button>
+
+          <a
+            href="/api/download-apk"
+            download="Aurora-AI-Studio.apk"
+            onClick={onCloseMobile}
+            className="w-full min-h-[44px] md:min-h-0 flex items-center gap-2.5 px-3 md:px-2.5 py-2.5 md:py-2 rounded-xl md:rounded-lg text-xs font-medium transition-opacity hover:opacity-80 cursor-pointer"
+            style={{ backgroundColor: 'var(--surface-elevated)' }}
+          >
+            <Download className="w-4 h-4 shrink-0" style={{ color: 'var(--accent-primary)' }} />
+            <span>Download Android APK</span>
+          </a>
 
           <div className="flex items-center justify-between gap-2 px-1.5 pt-1">
             <div className="flex items-center gap-2.5 min-w-0">

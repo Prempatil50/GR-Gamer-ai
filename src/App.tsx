@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
+import {
+  createUserWithEmailAndPassword,
+  onIdTokenChanged,
+  sendEmailVerification,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut,
+  updateProfile,
+  type User,
+} from 'firebase/auth';
 import {
   addDoc,
   collection,
@@ -20,6 +30,10 @@ import { LoginScreen } from './components/LoginScreen';
 import { OpportunitiesModal } from './components/OpportunitiesModal';
 import { Sidebar } from './components/Sidebar';
 import { ThemeDrawer } from './components/ThemeDrawer';
+import {
+  VerificationScreen,
+  type VerificationChallenge,
+} from './components/VerificationScreen';
 import { YouTubeConnectModal } from './components/YouTubeConnectModal';
 import { useVoiceAssistant } from './hooks/useVoiceAssistant';
 import {
@@ -90,7 +104,12 @@ export default function App() {
   const initialLang = useMemo(() => readCachedLanguage(), []);
   const [authReady, setAuthReady] = useState(false);
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [isEmailVerified, setIsEmailVerified] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [pendingChallenge, setPendingChallenge] = useState<VerificationChallenge | null>(
+    null
+  );
+  const [pendingUsername, setPendingUsername] = useState<string>('');
 
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [themePreset, setThemePreset] = useState<ThemePresetId>(initialTheme.preset);
@@ -134,26 +153,58 @@ export default function App() {
     }
   }, [themePreset, customBgColor]);
 
-  // Listen for Firebase Auth state
+  const authEventSeqRef = useRef(0);
+
+  // Listen for Firebase Auth & ID token state; verify JWT email_verified claim before unlocking Firestore
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (user) => {
+    const unsub = onIdTokenChanged(auth, (user) => {
+      const seq = ++authEventSeqRef.current;
       setFirebaseUser(user);
-      setAuthReady(true);
       if (!user) {
+        setIsEmailVerified(false);
+        setAuthReady(true);
         setUserProfile(null);
         setPages([]);
         setActivePageId(null);
         setMessages([]);
         setCustomOpportunities([]);
         setYoutubeChannels([]);
+        setPendingChallenge(null);
+        setPendingUsername('');
+        return;
       }
+
+      void (async () => {
+        try {
+          let tokenResult = await user.getIdTokenResult(false);
+          let claimVerified = tokenResult.claims.email_verified === true;
+          if (user.emailVerified && !claimVerified) {
+            tokenResult = await user.getIdTokenResult(true);
+            claimVerified = tokenResult.claims.email_verified === true;
+            if (claimVerified) {
+              await new Promise((resolve) => setTimeout(resolve, 150));
+            }
+          }
+          if (authEventSeqRef.current !== seq) return;
+          setIsEmailVerified(Boolean(user.emailVerified && claimVerified));
+        } catch {
+          if (authEventSeqRef.current !== seq) return;
+          setIsEmailVerified(false);
+        } finally {
+          if (authEventSeqRef.current === seq) {
+            setAuthReady(true);
+          }
+        }
+      })();
     });
     return () => unsub();
   }, []);
 
-  // Sync UserProfile document on sign-in
+  const isVerifiedSession = Boolean(authReady && firebaseUser && isEmailVerified);
+
+  // Sync UserProfile document on sign-in (only once email is verified per Firestore rules)
   useEffect(() => {
-    if (!authReady || !firebaseUser) return;
+    if (!isVerifiedSession || !firebaseUser) return;
 
     const uid = firebaseUser.uid;
     const userDocRef = doc(db, 'users', uid);
@@ -166,9 +217,14 @@ export default function App() {
 
         if (!snap.exists()) {
           const cached = readCachedTheme();
+          const fallbackName = (
+            firebaseUser!.displayName ||
+            pendingUsername ||
+            'User'
+          ).slice(0, 120);
           const newProfile: UserProfile = {
             uid,
-            displayName: (firebaseUser!.displayName || 'User').slice(0, 120),
+            displayName: fallbackName,
             email: (firebaseUser!.email || 'user@example.com').slice(0, 254),
             photoURL: (firebaseUser!.photoURL || '').slice(0, 500),
             themePreset: cached.preset,
@@ -234,11 +290,11 @@ export default function App() {
       cancelled = true;
       unsub();
     };
-  }, [authReady, firebaseUser]);
+  }, [isVerifiedSession, firebaseUser, pendingUsername]);
 
   // Listen to user's ChatPages
   useEffect(() => {
-    if (!authReady || !firebaseUser) return;
+    if (!isVerifiedSession || !firebaseUser) return;
     const uid = firebaseUser.uid;
     const pagesPath = `users/${uid}/pages`;
     const q = query(collection(db, pagesPath), where('ownerId', '==', uid));
@@ -266,11 +322,11 @@ export default function App() {
     );
 
     return () => unsub();
-  }, [authReady, firebaseUser]);
+  }, [isVerifiedSession, firebaseUser]);
 
   // Listen to user's Custom Opportunities
   useEffect(() => {
-    if (!authReady || !firebaseUser) return;
+    if (!isVerifiedSession || !firebaseUser) return;
     const uid = firebaseUser.uid;
     const oppsPath = `users/${uid}/opportunities`;
     const q = query(collection(db, oppsPath), where('ownerId', '==', uid));
@@ -293,11 +349,11 @@ export default function App() {
     );
 
     return () => unsub();
-  }, [authReady, firebaseUser]);
+  }, [isVerifiedSession, firebaseUser]);
 
   // Listen to user's Connected YouTube Channels
   useEffect(() => {
-    if (!authReady || !firebaseUser) return;
+    if (!isVerifiedSession || !firebaseUser) return;
     const uid = firebaseUser.uid;
     const ytPath = `users/${uid}/youtubeChannels`;
     const q = query(collection(db, ytPath), where('ownerId', '==', uid));
@@ -320,11 +376,11 @@ export default function App() {
     );
 
     return () => unsub();
-  }, [authReady, firebaseUser]);
+  }, [isVerifiedSession, firebaseUser]);
 
   // Listen to Messages for activePageId
   useEffect(() => {
-    if (!authReady || !firebaseUser || !activePageId) {
+    if (!isVerifiedSession || !firebaseUser || !activePageId) {
       setMessages([]);
       return;
     }
@@ -351,7 +407,7 @@ export default function App() {
     );
 
     return () => unsub();
-  }, [authReady, firebaseUser, activePageId]);
+  }, [isVerifiedSession, firebaseUser, activePageId]);
 
   const activePage = useMemo(
     () => pages.find((p) => p.id === activePageId) || null,
@@ -362,18 +418,151 @@ export default function App() {
     activePageRef.current = activePage;
   }, [activePage]);
 
+  const formatFirebaseAuthError = (err: unknown): string => {
+    const code =
+      typeof err === 'object' && err !== null && 'code' in err
+        ? String((err as { code?: unknown }).code)
+        : '';
+
+    switch (code) {
+      case 'auth/operation-not-allowed':
+        return 'Email/Password sign-in is not enabled in Firebase Console yet. Enable it in Firebase Console > Authentication > Sign-in method > Email/Password, or use Continue with Google.';
+      case 'auth/email-already-in-use':
+        return 'An account with this email already exists. Switch to Login to sign in.';
+      case 'auth/invalid-credential':
+      case 'auth/wrong-password':
+      case 'auth/user-not-found':
+        return 'Invalid email or password. Please check your credentials and try again.';
+      case 'auth/weak-password':
+        return 'Password is too weak. Use at least 6 characters.';
+      case 'auth/invalid-email':
+        return 'Please enter a valid email address.';
+      case 'auth/too-many-requests':
+        return 'Too many attempts. Please wait a few minutes and try again.';
+      default:
+        return err instanceof Error ? err.message : 'Authentication failed. Please try again.';
+    }
+  };
+
+  const requestVerificationCodeForUser = useCallback(
+    async (uid: string, email: string): Promise<VerificationChallenge | null> => {
+      try {
+        const resp = await fetch('/api/auth/verification-code', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uid, email }),
+        });
+        if (!resp.ok) return null;
+        const data = (await resp.json()) as VerificationChallenge;
+        setPendingChallenge(data);
+        return data;
+      } catch {
+        return null;
+      }
+    },
+    []
+  );
+
   const handleGoogleLogin = async () => {
     setAuthError(null);
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : 'Google Sign-In failed. Please try again.';
-      setAuthError(msg);
+      setAuthError(formatFirebaseAuthError(err));
     }
   };
 
+  const handleEmailSignUp = async (username: string, email: string, password: string) => {
+    setAuthError(null);
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, email, password);
+      setPendingUsername(username);
+      await updateProfile(cred.user, { displayName: username });
+      await requestVerificationCodeForUser(cred.user.uid, email);
+      try {
+        await sendEmailVerification(cred.user);
+      } catch {
+        // Non-fatal if Firebase throttles initial verification email; user can resend on Verification screen
+      }
+      setFirebaseUser(auth.currentUser);
+      setIsEmailVerified(false);
+    } catch (err) {
+      setAuthError(formatFirebaseAuthError(err));
+    }
+  };
+
+  const handleEmailSignIn = async (email: string, password: string) => {
+    setAuthError(null);
+    try {
+      const cred = await signInWithEmailAndPassword(auth, email, password);
+      if (!cred.user.emailVerified) {
+        setPendingUsername(cred.user.displayName || email.split('@')[0] || 'User');
+        await requestVerificationCodeForUser(cred.user.uid, email);
+        try {
+          await sendEmailVerification(cred.user);
+        } catch {
+          // User can trigger resend manually on Verification screen
+        }
+        setIsEmailVerified(false);
+        return;
+      }
+      const tokenResult = await cred.user.getIdTokenResult(true);
+      const claimVerified = tokenResult.claims.email_verified === true;
+      if (claimVerified) {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+      setIsEmailVerified(claimVerified);
+    } catch (err) {
+      setAuthError(formatFirebaseAuthError(err));
+    }
+  };
+
+  const handlePasswordReset = async (email: string) => {
+    setAuthError(null);
+    try {
+      await sendPasswordResetEmail(auth, email);
+    } catch (err) {
+      const formatted = formatFirebaseAuthError(err);
+      setAuthError(formatted);
+      throw err;
+    }
+  };
+
+  const handleResendFirebaseEmail = useCallback(async () => {
+    if (!auth.currentUser) {
+      throw new Error('No active account session found.');
+    }
+    try {
+      await sendEmailVerification(auth.currentUser);
+    } catch (err) {
+      throw new Error(formatFirebaseAuthError(err));
+    }
+  }, []);
+
+  const handleCheckEmailVerified = useCallback(async (): Promise<boolean> => {
+    if (!auth.currentUser) return false;
+    await auth.currentUser.reload();
+    if (!auth.currentUser.emailVerified) {
+      setIsEmailVerified(false);
+      return false;
+    }
+    const freshToken = await auth.currentUser.getIdTokenResult(true);
+    const claimVerified = freshToken.claims.email_verified === true;
+    if (!claimVerified) {
+      setIsEmailVerified(false);
+      return false;
+    }
+    // Allow Firestore's internal auth token listener to ingest the refreshed JWT before mounting listeners
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    setFirebaseUser(auth.currentUser);
+    setIsEmailVerified(true);
+    return true;
+  }, []);
+
   const handleSignOut = async () => {
+    setPendingChallenge(null);
+    setPendingUsername('');
+    setIsEmailVerified(false);
     await signOut(auth);
   };
 
@@ -643,7 +832,7 @@ export default function App() {
         return;
       }
       if (/^(boy voice|switch to boy voice|male voice)$/.test(normalized)) {
-        void handleSelectVoiceName('Charon');
+        void handleSelectVoiceName('Fenrir');
         return;
       }
       if (/^(girl voice|switch to girl voice|female voice)$/.test(normalized)) {
@@ -1162,13 +1351,40 @@ export default function App() {
 
   if (!firebaseUser) {
     return (
-      <LoginScreen onGoogleLogin={handleGoogleLogin} authError={authError} />
+      <LoginScreen
+        onGoogleLogin={handleGoogleLogin}
+        onEmailSignIn={handleEmailSignIn}
+        onEmailSignUp={handleEmailSignUp}
+        onPasswordReset={handlePasswordReset}
+        authError={authError}
+        onClearError={() => setAuthError(null)}
+      />
+    );
+  }
+
+  if (!isEmailVerified) {
+    const emailForVerification = firebaseUser.email || '';
+    const usernameForVerification =
+      firebaseUser.displayName || pendingUsername || emailForVerification.split('@')[0] || 'User';
+    return (
+      <VerificationScreen
+        uid={firebaseUser.uid}
+        username={usernameForVerification}
+        email={emailForVerification}
+        challenge={pendingChallenge}
+        onRequestNewCode={() =>
+          requestVerificationCodeForUser(firebaseUser.uid, emailForVerification)
+        }
+        onResendFirebaseEmail={handleResendFirebaseEmail}
+        onCheckEmailVerified={handleCheckEmailVerified}
+        onSignOut={handleSignOut}
+      />
     );
   }
 
   const effectiveProfile: UserProfile = userProfile || {
     uid: firebaseUser.uid,
-    displayName: firebaseUser.displayName || 'User',
+    displayName: firebaseUser.displayName || pendingUsername || 'User',
     email: firebaseUser.email || '',
     photoURL: firebaseUser.photoURL || '',
     themePreset,
@@ -1267,7 +1483,7 @@ export default function App() {
         onStartVoiceCommand={() => startListening(voiceAutoSend)}
         onTestVoice={(voice) => {
           void speakText(
-            'preview',
+            `preview-${voice}`,
             getLanguageOption(preferredLanguage).samplePreview,
             voice
           );
